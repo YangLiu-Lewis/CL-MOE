@@ -51,7 +51,6 @@ class CLMoEMOELoraConfig(LoraConfig):
     This is the configuration class to store the configuration of a [`~peft.MOE_LORA_CLMoE`]
     """
     task_embedding_dim: int = field(default=64)
-    target_modules=["gate_proj", "up_proj", "down_proj"],  # For FFN only
     expert_num: int = field(default=4)
 
     def __post_init__(self):
@@ -70,63 +69,66 @@ class CLMoEMOELoraModel(LoraModel):
         self.add_adapter(adapter_name, self.peft_config[adapter_name])
 
     def add_adapter(self, adapter_name, config=None):
-        if config is not None:  # get the lora config
+        # 如果传入了 config，则先准备 LoRA 配置
+        if config is not None:
+            # 取出 base model 的 config（有些模型 config 不是 dict，要做兼容）
             model_config = self.model.config.to_dict() if hasattr(self.model.config, "to_dict") else self.model.config
-            config = self._prepare_clitmoelora_config(config, model_config)   # load config
-            self.peft_config[adapter_name] = config # subsititue the original config
+            # 根据 base model config 和 LoRA 配置进行检查/补充（比如 target_modules 自动补全）
+            config = self._prepare_clitmoelora_config(config, model_config)
+            # 把这个 config 存到 self.peft_config 中，用 adapter_name 作为 key
+            self.peft_config[adapter_name] = config  # 替换掉旧的配置
+
+        # 遍历模型，把符合条件的 Linear 层替换成 CLMoEMOELoraLinear
         self._find_and_replace(adapter_name)
+
+        # 检查 bias 配置是否合法
+        # 如果存在多个 adapter（多任务场景），只允许一个 adapter 带 bias，其他必须是 bias="none"
         if len(self.peft_config) > 1 and self.peft_config[adapter_name].bias != "none":
             raise ValueError(
-                "MMOELoraModel supports only 1 adapter with bias. When using multiple adapters, set bias to 'none' for all adapters."
+                "MMOELoraModel supports only 1 adapter with bias. "
+                "When using multiple adapters, set bias to 'none' for all adapters."
             )
 
+        # 只让 LoRA 参数（而不是整个模型）是可训练的
         mark_only_lora_as_trainable(self.model, self.peft_config[adapter_name].bias)
+
+        # 如果这个 adapter 处于 inference 模式（只推理不用训练）
+        # 就冻结掉它的参数，避免梯度更新
         if self.peft_config[adapter_name].inference_mode:
             _freeze_adapter(self.model, adapter_name)
 
-
     def _find_and_replace(self, adapter_name):
-        """Replace the target `Linear` module with LoRA layer (Linear+LoRA)"""
+        """扫描并替换模型中的目标层为 LoRA/MoE LoRA 层"""
         lora_config = self.peft_config[adapter_name]
-        self._check_quantization_dependency()
+        self._check_quantization_dependency()  # 检查是否满足量化依赖
         is_target_modules_in_base_model = False
-        key_list = [key for key, _ in self.model.named_modules()]   # all module in raw model
+
+        # 遍历所有子模块
+        key_list = [key for key, _ in self.model.named_modules()]
         for key in key_list:
+            # 如果不是目标模块（不在 target_modules 列表），跳过
             if not self._check_target_module_exists(lora_config, key):
                 continue
 
             is_target_modules_in_base_model = True
             parent, target, target_name = _get_submodules(self.model, key)
 
+            # 如果目标层已经是 LoRA 层，则更新 LoRA 配置
             if isinstance(target, LoraLayer) and isinstance(target, torch.nn.Conv2d):
-                target.update_layer_conv2d(
-                    adapter_name,
-                    lora_config.r,
-                    lora_config.lora_alpha,
-                    lora_config.lora_dropout,
-                    lora_config.init_lora_weights,
-                )
+                target.update_layer_conv2d(adapter_name, lora_config.r, lora_config.lora_alpha,
+                                           lora_config.lora_dropout, lora_config.init_lora_weights)
             elif isinstance(target, LoraLayer) and isinstance(target, torch.nn.Embedding):
-                target.update_layer_embedding(
-                    adapter_name,
-                    lora_config.r,
-                    lora_config.lora_alpha,
-                    lora_config.lora_dropout,
-                    lora_config.init_lora_weights,
-                )
-
+                target.update_layer_embedding(adapter_name, lora_config.r, lora_config.lora_alpha,
+                                              lora_config.lora_dropout, lora_config.init_lora_weights)
             elif isinstance(target, LoraLayer):
-                target.update_layer(
-                    adapter_name,
-                    lora_config.r,
-                    lora_config.lora_alpha,
-                    lora_config.lora_dropout,
-                    lora_config.init_lora_weights,
-                )
+                target.update_layer(adapter_name, lora_config.r, lora_config.lora_alpha,
+                                    lora_config.lora_dropout, lora_config.init_lora_weights)
+            # 如果还是普通层（Linear/Conv1D 等），替换成 CLMoEMOELoraLinear 或对应 LoRA 封装
             else:
                 new_module = self._create_new_module(lora_config, adapter_name, target)
                 self._replace_module(parent, target_name, new_module, target)
-        
+
+        # 如果没找到目标模块，抛出异常
         if not is_target_modules_in_base_model:
             raise ValueError(
                 f"Target modules {lora_config.target_modules} not found in the base model. "
@@ -206,8 +208,8 @@ class CLMoEMOELoraModel(LoraModel):
                     f"Target module {target} is not supported. "
                     f"Currently, only `torch.nn.Linear` and `Conv1D` are supported."
                 )
-            new_module = CLMoEMOELoraLinear(adapter_name, in_features, out_features, 
-                                                    bias=bias, **kwargs)
+            new_module = CLMoEMOELoraLinear(adapter_name, in_features, out_features,
+                                            bias=bias, **kwargs)
 
         return new_module
 
@@ -272,11 +274,11 @@ class CLMoEMOELoraModel(LoraModel):
 class CLMoEMOELoraLayer(LoraLayer):
 
     def __init__(self, in_features: int, out_features: int, expert_num: int):
-        
+
         super().__init__(in_features, out_features)
         self.expert_num = expert_num
-        
-    
+
+
     def update_layer(self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights):
         self.r[adapter_name] = r
         self.lora_alpha[adapter_name] = lora_alpha
@@ -294,7 +296,7 @@ class CLMoEMOELoraLayer(LoraLayer):
         if init_lora_weights:
             self.reset_lora_parameters(adapter_name)
         self.to(self.weight.device)
-    
+
     def reset_lora_parameters(self, adapter_name):
         if adapter_name in self.lora_A.keys():
             # initialize A the same way as the default for nn.Linear and B to zero
@@ -304,17 +306,17 @@ class CLMoEMOELoraLayer(LoraLayer):
 
 class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
     # Lora implemented in a dense layer
-    # nn.Linear is the pretrained weights in LLM, MMOELoraLayer is the designed trainable Lora 
+    # nn.Linear is the pretrained weights in LLM, MMOELoraLayer is the designed trainable Lora
     def __init__(
-        self,
-        adapter_name: str,
-        in_features: int,
-        out_features: int,
-        r: int = 0,
-        lora_alpha: int = 1,
-        lora_dropout: float = 0.0,
-        fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
-        **kwargs,
+            self,
+            adapter_name: str,
+            in_features: int,
+            out_features: int,
+            r: int = 0,
+            lora_alpha: int = 1,
+            lora_dropout: float = 0.0,
+            fan_in_fan_out: bool = False,  # Set this to True if the layer to replace stores weight like (fan_in, fan_out)
+            **kwargs,
     ):
         init_lora_weights = kwargs.pop("init_lora_weights", True)
         self.expert_num = kwargs.pop("expert_num", True)
@@ -323,22 +325,22 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
         self.topk = 2
 
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
-        CLMoEMOELoraLayer.__init__(self, in_features=in_features, 
-                               out_features=out_features, 
-                               expert_num=self.expert_num)
-        
-        # init the Gate network
+        CLMoEMOELoraLayer.__init__(self, in_features=in_features,
+                                   out_features=out_features,
+                                   expert_num=self.expert_num)
+
+        # init the Gate network 建立路由器分配专家，这里是单纯的线性的
         self.lora_router = nn.ModuleDict({})
         self.lora_router.update(nn.ModuleDict({adapter_name: nn.Linear(self.in_features, self.expert_num, bias=False)}))
-        # print(self.lora_router)
-        # Freezing the pre-trained weight matrix
-        self.weight.requires_grad = False
+
+        self.weight.requires_grad = False   #冻结与训练的linear层，只训练lora和路由部分
 
         self.fan_in_fan_out = fan_in_fan_out
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
-
+        # 重置 Linear 层参数在没有加载预训练层权重的情况才生效。
         nn.Linear.reset_parameters(self)
+        #建立 LoRA 的 A、B 矩阵（按专家数）并初始化。
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
 
@@ -382,57 +384,74 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
             self.merged = False
 
     def forward(self, x: torch.Tensor, **kwargs):
-        previous_dtype = x.dtype
-        if self.active_adapter not in self.lora_A.keys():   # No adapter, directly use linear
+        previous_dtype = x.dtype  # 记录输入张量原始数据类型，最后要转换回去
+
+        # ====== Case 1: 当前 adapter 不存在 ======
+        if self.active_adapter not in self.lora_A.keys():
+            # 没有 LoRA adapter，直接走冻结的主线性层
             return F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-        if self.disable_adapters:   # No adapter
-            if self.r[self.active_adapter] > 0 and self.merged: # merge the adapter to linear
+
+        # ====== Case 2: adapter 被禁用 ======
+        if self.disable_adapters:
+            # 如果禁用了 adapter 且之前 merge 过，就要先 unmerge，避免重复加权
+            if self.r[self.active_adapter] > 0 and self.merged:
                 self.unmerge()
-            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
-        elif self.r[self.active_adapter] > 0:   # general lora process
+            # 只使用冻结的主线性层
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
+        # ====== Case 3: 正常 LoRA 路径 ======
+        elif self.r[self.active_adapter] > 0:
+            # 先走冻结主线性层的输出
+            result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
+
+            # 转换输入 dtype，使其与 LoRA 权重一致（避免混合精度出错）
             x = x.to(self.lora_A[self.active_adapter].loraA[0].weight.dtype)
+
+            # 把路由器移到输入所在的设备（GPU/CPU）
             self.lora_router = self.lora_router.to(x.device)
+
+            # 路由器前向：输入特征 → 各个专家的分配分数
             router = self.lora_router[self.active_adapter](x)
 
+            # Softmax 归一化，得到每个 token 在不同专家上的概率分布
             router = torch.softmax(router, dim=-1)
 
-            with open("/srv/scratch/cruise/Yang/CL-MoE/CLMoE/task.txt", "r" , encoding="utf-8") as f:
+            # ====== 统计逻辑（每秒=30时才触发，主要用于专家利用率分析不是必要逻辑，单纯统计处理） ======
+            with open("/srv/scratch/cruise/Yang/CL-MoE/CLMoE/task.txt", "r", encoding="utf-8") as f:
                 task = f.read()
             import datetime
-
             current_time = datetime.datetime.now()
-
             current_second = current_time.second
             if current_second == 30:
-                router_topk_values, router_topk_indices = torch.topk(router, 2, dim=-1)  
-                invalid_mask = (router_topk_values[:,:,0] == router_topk_values[:,:,1])
-                # print("softmax check: %f",router_topk_values[:,:],)
+                # 取路由概率最大的 top-2 专家
+                router_topk_values, router_topk_indices = torch.topk(router, 2, dim=-1)
+                # 如果 top-1 和 top-2 概率相同，则标记为无效
+                invalid_mask = (router_topk_values[:, :, 0] == router_topk_values[:, :, 1])
                 router_topk_indices[invalid_mask] = -1
+                # 统计专家被选中的次数并写入日志文件
                 flattened_tensor = router_topk_indices.cpu().flatten()
                 unique_values, counts = np.unique(flattened_tensor, return_counts=True)
                 txt_file_path = "value_counts_" + task + ".txt"
-
                 with open(txt_file_path, "a") as txt_file:
                     for value, count in zip(unique_values, counts):
                         txt_file.write(f"{value}:{count}\n")
-            
-            # alpha = 0.5
-            # arr = [] # The contribution of top-2 experts infered from the statistics
 
+            # ====== LoRA 路径：逐专家加权输出 ======
             for i in range(self.expert_num):
-                result += ( # lora process
-                    self.lora_B[self.active_adapter].loraB[i](
-                        self.lora_A[self.active_adapter].loraA[i](self.lora_dropout[self.active_adapter](x)),
-                    )
-                    * self.scaling[self.active_adapter]
-                    # * (alpha * router[:,:,i].unsqueeze(-1) + (1 - alpha) * arr[i]) # test stage
-                    * router[:,:,i].unsqueeze(-1) # train stage
+                result += (
+                    # LoRA A → dropout → LoRA B
+                        self.lora_B[self.active_adapter].loraB[i](
+                            self.lora_A[self.active_adapter].loraA[i](self.lora_dropout[self.active_adapter](x)),
+                        )
+                        * self.scaling[self.active_adapter]  # 缩放因子 alpha/r
+                        * router[:, :, i].unsqueeze(-1)  # 按路由概率加权（train 阶段）
                 )
+
+        # ====== Case 4: 兜底情况 ======
         else:
             result = F.linear(x, transpose(self.weight, self.fan_in_fan_out), bias=self.bias)
 
+        # 转回输入时的数据类型，保证一致
         result = result.to(previous_dtype)
 
         return result
@@ -450,11 +469,11 @@ class CLMoEMOELinearA(nn.Module):
 
         assert self.out_features % self.expert_num == 0  # lora rank should be divided by expert number
         self.r = self.out_features // self.expert_num
-        
+
         for _ in range(self.expert_num):
             self.loraA.append(CLMoEMOEExpert(self.in_features, self.r))
 
-    
+
     def forward(self, x):
         '''input x is a vector, return output is a list'''
         outputs = []
@@ -462,7 +481,7 @@ class CLMoEMOELinearA(nn.Module):
             outputs.append(self.loraA[i](x))
 
         return outputs
-    
+
 class CLMoEMOELinearB(nn.Module):
     '''MMOE based LoRA block'''
     def __init__(self, in_features, out_features, expert_num) -> None:
@@ -475,11 +494,11 @@ class CLMoEMOELinearB(nn.Module):
 
         assert self.in_features % self.expert_num == 0
         self.r = self.in_features // self.expert_num
-        
+
         for _ in range(self.expert_num):
             self.loraB.append(CLMoEMOEExpert(self.r, self.out_features))
 
-    
+
     def forward(self, x):
         '''input x is a list, return output is also a list'''
         outputs = []
@@ -488,18 +507,18 @@ class CLMoEMOELinearB(nn.Module):
 
         return outputs
 
-
+# 相当于外部的权重接口，后续使用CKA分析也可做这个。
 
 class CLMoEMOEExpert(nn.Module):
 
     def __init__(self, in_features, out_features):
-        
+
         super().__init__()
 
         self.in_features, self.out_features = in_features, out_features
         self.mlp = nn.Linear(self.in_features, self.out_features, bias=False)
         self.weight = self.mlp.weight
-    
+
 
     def forward(self, x):
         # LoRA A or B block
@@ -514,10 +533,10 @@ class CLMoEMOEGate(nn.Module):
     def __init__(self, input_size, expert_num):
 
         super().__init__()
-        # 使用embedding来代替线性层
+        # 使用embedding来代替线性层 特征投影到expert_num
         self.GateL = nn.Linear(input_size, expert_num, bias=False)
-        self.act = nn.Softmax(dim=1)    # 第0维为batch size
-    
+        self.act = nn.Softmax(dim=1)    # 第0维为batch size to logits
+
     def forward(self, x):
 
         y = self.GateL(x)
@@ -539,45 +558,60 @@ class CLMoEMOERouter(nn.Module):
 
     def __init__(self, config: CLMoEMOELoraConfig):
         super().__init__()
+        # 专家数（注意：这里字段叫 num_experts，而你的其他处常用 expert_num，命名需统一）
         self.num_experts = config.num_experts
+        # 每个专家可接收的 token 容量上限（超过就被丢弃或置零）
         self.expert_capacity = config.expert_capacity
+        # 路由器分类头：hidden_size -> num_experts，输出每个专家的打分
         self.classifier = nn.Linear(config.hidden_size, self.num_experts, bias=config.router_bias)
+        # 训练时对输入加均匀噪声的幅度，提升探索性/避免崩塌
         self.jitter_noise = config.router_jitter_noise
+        # 是否忽略 padding token（本实现里没有显式用到，可在上游先做 mask）
         self.ignore_padding_tokens = config.router_ignore_padding_tokens
+        # 计算时采用的 dtype（通常是 float32，更稳定），输出再 cast 回输入 dtype
         self.dtype = getattr(torch, config.router_dtype)
 
     def _compute_router_probabilities(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-
+        # 记录输入的原始 dtype，便于最后 cast 回去
         self.input_dtype = hidden_states.dtype
+        # 计算前把 hidden_states 转到更稳定的 dtype（如 float32）
         hidden_states = hidden_states.to(self.dtype)
 
         if self.training and self.jitter_noise > 0:
-            # Multiply the token inputs by the uniform distribution - adding some noise
+            # 训练期按均匀分布在 (1-ε, 1+ε) 乘噪，防止路由过早集中到单个专家
             hidden_states *= torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
 
-        # Shape: [num_groups, tokens_per_group, num_experts]
+        # 线性分类得到 router logits（形状：[..., num_experts]）
         self._cast_classifier()
         router_logits = self.classifier(hidden_states)
 
-        # Apply Softmax and cast back to the original `dtype`
+        # softmax -> 概率，计算用稳定 dtype，随后 cast 回输入 dtype
         router_probabilities = nn.functional.softmax(router_logits, dim=-1, dtype=self.dtype).to(self.input_dtype)
         return router_probabilities, router_logits
 
     def _cast_classifier(self):
+        # 确保分类头的参数已经转到指定 dtype（float32 等）
         if not (hasattr(self.classifier, "SCB") or hasattr(self.classifier, "CB")):
             self.classifier = self.classifier.to(self.dtype)
 
     def forward(self, hidden_states: torch.Tensor) -> Tuple:
+        # 得到每个 token 在各专家上的概率与 logits
         router_probs, router_logits = self._compute_router_probabilities(hidden_states)
 
+        # Top-1 选择：对每个 token 取 argmax 专家，one-hot 编码
         expert_index = torch.argmax(router_probs, dim=-1)
         expert_index = torch.nn.functional.one_hot(expert_index, num_classes=self.num_experts)
 
-        # Mask tokens outside expert capacity. Sum over each sequence
-        token_priority = torch.cumsum(expert_index, dim=-2)
-        # mask if the token routed to to the expert will overflow
+        # 容量裁剪：按序累计每个专家已分配的 token 数，超出 expert_capacity 的置 0
+        token_priority = torch.cumsum(expert_index, dim=-2)  # 沿 token 维度累计
         expert_capacity_mask = token_priority <= self.expert_capacity
-        expert_index = expert_index * expert_capacity_mask
+        expert_index = expert_index * expert_capacity_mask  # 超限的 token 不再分配给该专家
 
+        # 同时返回每个 token 的最大路由概率（便于算辅助损失/监控）
         router_probs = torch.max(router_probs, dim=-1).values.unsqueeze(-1)
+
+        # 返回：
+        # expert_index: one-hot 的专家索引（容量裁剪后，可能全 0）
+        # router_probs: 对应的最大概率（形如 [..., 1]）
+        # router_logits: 原始 logits（可用于负载均衡损失等）
         return expert_index, router_probs, router_logits
