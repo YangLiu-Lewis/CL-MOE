@@ -1,0 +1,63 @@
+*.pt
+*.pth
+*.bin
+checkpoints/
+logs/
+outputs/
+# HuggingFace transformers
+pytorch_model*.bin
+tf_model*.h5
+flax_model.msgpack
+rust_model.ot
+
+# LoRA / Adapter weights
+*.safetensors
+adapter_config.json
+adapter_model.*
+
+# Distributed training optimizer states
+*.opt
+*.os
+*.state
+
+# Checkpoints / output dirs
+checkpoints/
+outputs/
+results/
+runs/
+
+# TensorBoard / wandb
+events.out.tfevents.*
+wandb/
+
+# Deepspeed / vLLM / Ray logs
+ds_logs/
+logs/
+ray_results/
+mlruns/
+
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+.cache/
+.ipynb_checkpoints/
+
+# VSCode
+.vscode/
+.history/
+*.png
+*.OU
+*.o*
+# JetBrains
+.idea/
+
+# Environment dumps
+.env
+*.swp
+*.swo
+vis_masks/
