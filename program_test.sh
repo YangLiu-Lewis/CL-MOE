@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N Lora_moe_original_Train_multi
+#PBS -N Lora_moe_warmup_Train_multi
 #PBS -l select=1:ncpus=4:ngpus=2:gpu_model=H200:mem=120gb -l walltime=12:00:00
 #PBS -j oe
 #PBS -j oe
@@ -35,4 +35,4 @@ export CUDA_VISIBLE_DEVICES=0,1
 echo ">>> Running GPU_test.py..."
 conda activate cl
 cd /srv/scratch/cruise/Yang/Lora-MoE/
-bash scripts/LoraMoE/Train_MOE/Train.sh
+bash scripts/LoraMoE/Eval/Eval_all.sh
