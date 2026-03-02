@@ -1,6 +1,6 @@
 #!/bin/bash
 
-gpu_list="${CUDA_VISIBLE_DEVICES:-0,1}"
+gpu_list="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 IFS=',' read -ra GPULIST <<< "$gpu_list"
 
 CHUNKS=${#GPULIST[@]}

@@ -589,7 +589,6 @@ def preprocess_plain(
 
     return dict(input_ids=input_ids, labels=targets)
 
-
 def preprocess(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
@@ -602,6 +601,75 @@ def preprocess(
     3. Tokenize the concatenated conversation;
     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
     """
+    
+    if not has_image and len(sources) > 0 and len(sources[0]) > 0 and "Instruction:" in sources[0][0].get('value', ''):
+        input_ids = []
+        targets = []
+        
+        for source in sources:
+            human_text = source[0]['value']  # 获取 "Instruction: ... \n\nInput: ..."
+            gpt_text = source[1]['value']    # 获取目标答案
+            
+            # 1. 拼接成纯净的 Prompt
+            # 💡 提示：确保 Output: 后面的空格处理与训练时一致
+            prompt = human_text + "\n\nOutput: " 
+            full_text = prompt + gpt_text + tokenizer.eos_token
+            
+            # 2. Tokenize 完整文本
+            tokenized_full = tokenizer(
+                full_text,
+                return_tensors="pt",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                add_special_tokens=True # 确保包含 <s>
+            ).input_ids[0]
+            
+            # 3. 精准计算 Prompt 长度
+            # 💡 核心修复：单独计算 prompt 长度时，我们要看它在整句里的实际位置
+            tokenized_prompt = tokenizer(
+                prompt,
+                return_tensors="pt",
+                max_length=tokenizer.model_max_length,
+                truncation=True,
+                add_special_tokens=True # 保持与 full 一致的 BOS 处理
+            ).input_ids[0]
+            
+            prompt_len = len(tokenized_prompt)
+
+            # 🚨 修正索引偏移 (Off-by-one Error)
+            # 在 Llama 分词器中，"Output: " 结尾的空格经常会和后面的第一个字母合并
+            # 如果我们发现第 prompt_len-1 个 token 已经是字母了，就回退一位
+            if prompt_len > 0:
+                # 解码当前判定的最后一个 prompt token
+                last_token_text = tokenizer.decode([tokenized_full[prompt_len - 1]])
+                # 如果这个 token 包含字母或数字（说明它把答案的开头吞了），则 prompt_len 减 1
+                if any(c.isalnum() for c in last_token_text) and ":" not in last_token_text:
+                    prompt_len -= 1
+
+            # 4. 安全防护：防止索引越界
+            prompt_len = min(prompt_len, tokenizer.model_max_length)
+            
+            # 5. 构造 Labels：精准遮盖
+            label = tokenized_full.clone()
+            label[:prompt_len] = IGNORE_INDEX
+            
+            # ==================== TOKEN 对齐检查 (保留你的调试逻辑) ====================
+                # print("\n" + "="*20 + " TOKEN 对齐检查 (修正后) " + "="*20)
+                # print(f"Input IDs (前5个): {tokenized_full[:5].tolist()}") 
+                # valid_label_idx = (label != -100).nonzero(as_tuple=True)[0]
+                # if len(valid_label_idx) > 0:
+                #     first_label_token = label[valid_label_idx[0]]
+                #     print(f"第一个预测 Token ID: {first_label_token}")
+                #     print(f"第一个预测 Token 文本: '{tokenizer.decode([first_label_token])}'")
+                #     # 预期：这里应该打印出 ' POS' 或 ' NEG'，而不是 'OS' 或 'EG'
+                # print("="*54 + "\n")
+            # =======================================================================
+
+            input_ids.append(tokenized_full)
+            targets.append(label)
+        
+        return dict(input_ids=input_ids, labels=targets)
+    # ==========================================================
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
@@ -610,12 +678,14 @@ def preprocess(
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
         return preprocess_mpt(sources, tokenizer)
+        
     # add end signal and concatenate together
     conversations = []
     for source in sources:
         header = f"{conversation_lib.default_conversation.system}\n\n"
         conversation = _add_speaker_and_signal(header, source)
         conversations.append(conversation)
+        
     # tokenize conversations
     def get_tokenize_len(prompts):
         return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
@@ -636,50 +706,275 @@ def preprocess(
         _mask_targets(target, tokenized_lens, speakers)
 
     return dict(input_ids=input_ids, labels=targets)
+# def preprocess(
+#     sources: Sequence[str],
+#     tokenizer: transformers.PreTrainedTokenizer,
+#     has_image: bool = False
+# ) -> Dict:
+#     """
+#     Given a list of sources, each is a conversation list. This transform:
+#     1. Add signal '### ' at the beginning each sentence, with end signal '\n';
+#     2. Concatenate conversations together;
+#     3. Tokenize the concatenated conversation;
+#     4. Make a deepcopy as the target. Mask human words with IGNORE_INDEX.
+#     """
+#     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.PLAIN:
+#         return preprocess_plain(sources, tokenizer)
+#     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
+#         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
+#     if conversation_lib.default_conversation.version.startswith("v1"):
+#         return preprocess_v1(sources, tokenizer, has_image=has_image)
+#     if conversation_lib.default_conversation.version == "mpt":
+#         return preprocess_mpt(sources, tokenizer)
+#     # add end signal and concatenate together
+#     conversations = []
+#     for source in sources:
+#         header = f"{conversation_lib.default_conversation.system}\n\n"
+#         conversation = _add_speaker_and_signal(header, source)
+#         conversations.append(conversation)
+#     # tokenize conversations
+#     def get_tokenize_len(prompts):
+#         return [len(tokenizer_image_token(prompt, tokenizer)) for prompt in prompts]
+
+#     if has_image:
+#         input_ids = [tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations]
+#     else:
+#         conversations_tokenized = _tokenize_fn(conversations, tokenizer)
+#         input_ids = conversations_tokenized["input_ids"]
+
+#     targets = copy.deepcopy(input_ids)
+#     for target, source in zip(targets, sources):
+#         if has_image:
+#             tokenized_lens = get_tokenize_len([header] + [s["value"] for s in source])
+#         else:
+#             tokenized_lens = _tokenize_fn([header] + [s["value"] for s in source], tokenizer)["input_ids_lens"]
+#         speakers = [sentence["from"] for sentence in source]
+#         _mask_targets(target, tokenized_lens, speakers)
+
+#     return dict(input_ids=input_ids, labels=targets)
+# class CPMoEDataset(Dataset):
+#     """Dataset for supervised fine-tuning."""
+
+#     def __init__(self, data_path: str,
+#                  tokenizer: transformers.PreTrainedTokenizer,
+#                  data_args: DataArguments,
+#                  model_args: ModelArguments = None):
+#         super(CPMoEDataset, self).__init__()
+#         list_data_dict = json.load(open(data_path, "r"))
+
+#         if data_args.memory_data_path is not None:
+#             list_memory_data_dict = json.load(open(data_args.memory_data_path, "r"))
+
+#             list_data_dict = list_data_dict + list_memory_data_dict
+            
+#             random.shuffle(list_data_dict)
+
+#         rank0_print("Formatting inputs...Skip in lazy mode")
+#         self.tokenizer = tokenizer
+#         self.list_data_dict = list_data_dict
+#         self.data_args = data_args
+#         # 估算 Warmup 需要多少样本，并把它们复制一份放在最前面
+#         # 这样 TE 训练完副本后，SE 刚好能从正本开始训练
+#         if model_args is not None and model_args.warmup_tokens > 0:
+#             # 1. 获取预设的 warmup token 数量
+#             target_tokens = model_args.warmup_tokens
+            
+#             # 2. 估算每个样本的平均长度 (为了效率，只采样前100个估算)
+#             sample_size = min(len(self.list_data_dict), 100)
+#             if sample_size > 0:
+#                 total_len = 0
+#                 for i in range(sample_size):
+#                     # 简单估算：字符数 / 3 (近似 Token 数) + 图片 Token
+#                     sample = self.list_data_dict[i]
+#                     text_len = sum(len(conv['value']) for conv in sample['conversations']) // 3
+#                     img_len = 576 if 'image' in sample else 0 # 假设图片 token 数，根据你的 config 调整
+#                     total_len += (text_len + img_len)
+                
+#                 avg_len = max(1, total_len // sample_size)
+                
+#                 # 3. 计算需要复制多少样本
+#                 num_replay_samples = int(math.ceil(target_tokens / avg_len))
+                
+#                 # 4. 安全限制：不要复制超过整个数据集
+#                 num_replay_samples = min(num_replay_samples, len(self.list_data_dict))
+                
+#                 if num_replay_samples > 0:
+#                     rank0_print(f"\n[CP-MoE Strategy] Warmup Replay Activated:")
+#                     rank0_print(f"  - Target Warmup Tokens: {target_tokens}")
+#                     rank0_print(f"  - Est. Avg Length: {avg_len}")
+#                     rank0_print(f"  - Replicating first {num_replay_samples} samples for TE training.")
+                    
+#                     # 5. 执行复制：[Warmup Copies] + [Original Full Data]
+#                     warmup_subset = copy.deepcopy(self.list_data_dict[:num_replay_samples])
+#                     self.list_data_dict = warmup_subset + self.list_data_dict
+                    
+#                     rank0_print(f"  - New Dataset Size: {len(self.list_data_dict)}\n")
+#     def __len__(self):
+#         return len(self.list_data_dict)
+
+#     @property
+#     def lengths(self):
+#         length_list = []
+#         for sample in self.list_data_dict:
+#             img_tokens = 128 if 'image' in sample else 0
+#             length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+#         return length_list
+
+#     @property
+#     def modality_lengths(self):
+#         length_list = []
+#         for sample in self.list_data_dict:
+#             cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+#             cur_len = cur_len if 'image' in sample else -cur_len
+#             length_list.append(cur_len)
+#         return length_list
+
+#     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+#         sources = self.list_data_dict[i]
+#         if isinstance(i, int):
+#             sources = [sources]
+#         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+#         if 'image' in sources[0]:
+#             image_file = self.list_data_dict[i]['image']
+#             image_folder = self.data_args.image_folder
+#             processor = self.data_args.image_processor
+#             image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+#             if self.data_args.image_aspect_ratio == 'pad':
+#                 def expand2square(pil_img, background_color):
+#                     width, height = pil_img.size
+#                     if width == height:
+#                         return pil_img
+#                     elif width > height:
+#                         result = Image.new(pil_img.mode, (width, width), background_color)
+#                         result.paste(pil_img, (0, (width - height) // 2))
+#                         return result
+#                     else:
+#                         result = Image.new(pil_img.mode, (height, height), background_color)
+#                         result.paste(pil_img, ((height - width) // 2, 0))
+#                         return result
+#                 image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+#                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+#             else:
+#                 image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+#             sources = preprocess_multimodal(
+#                 copy.deepcopy([e["conversations"] for e in sources]),
+#                 self.data_args)
+#         else:
+#             sources = copy.deepcopy([e["conversations"] for e in sources])
+#         data_dict = preprocess(
+#             sources,
+#             self.tokenizer,
+#             has_image=('image' in self.list_data_dict[i]))
+#         if isinstance(i, int):
+#             data_dict = dict(input_ids=data_dict["input_ids"][0],
+#                              labels=data_dict["labels"][0])
+
+#         # image exist in the data
+#         if 'image' in self.list_data_dict[i]:
+#             data_dict['image'] = image
+#         elif self.data_args.is_multimodal:
+#             # image does not exist in the data, but the model is multimodal
+#             crop_size = self.data_args.image_processor.crop_size
+#             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+#         return data_dict
+
 class CPMoEDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
+    """Dataset for supervised fine-tuning with SuperNI compatibility and MoE Warmup."""
 
     def __init__(self, data_path: str,
                  tokenizer: transformers.PreTrainedTokenizer,
-                 data_args: DataArguments,
-                 model_args: ModelArguments = None):
+                 data_args, 
+                 model_args = None):
         super(CPMoEDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
+        
+        # ==================== 1. 强健的文件读取：同时兼容 JSON 和 JSONL ====================
+        loaded_data = None
+        try:
+            with open(data_path, "r", encoding="utf-8") as f:
+                loaded_data = json.load(f)
+        except json.decoder.JSONDecodeError:
+            # 如果标准 load 失败（报 Extra data），说明它是 JSONL 格式，按行读取
+            loaded_data = []
+            with open(data_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():  # 跳过空行
+                        loaded_data.append(json.loads(line))
+        
+        # ==================== 2. 万能格式转换：统一转为 conversations ====================
+        list_data_dict = []
+        
+        # 情况 A: 官方 SuperNI 原版格式 (大字典包含 Definition 和 Instances)
+        if isinstance(loaded_data, dict) and "Instances" in loaded_data:
+            definition = loaded_data.get('Definition', [''])[0]
+            for instance in loaded_data['Instances']:
+                user_input = instance.get('input', '')
+                target_output = instance.get('output', [''])[0] if isinstance(instance.get('output'), list) else instance.get('output', '')
+                
+                conversation = [
+                    {"from": "human", "value": f"Instruction: {definition}\n\nInput: {user_input}"},
+                    {"from": "gpt", "value": target_output}
+                ]
+                list_data_dict.append({"conversations": conversation})
+        # # 情况 B: 列表/JSONL 格式 (你截图里的格式)
+        # elif isinstance(loaded_data, list):
+        #     for instance in loaded_data:
+        #         # 如果发现它已经是处理好的 conversations 格式，直接原样保留
+        #         if "conversations" in instance:
+        #             list_data_dict.append(instance)
+        #             continue
+                
+        #         # 动态获取并兼容不同的键名
+        #         definition = instance.get("definition", instance.get("Definition", ""))
+        #         if isinstance(definition, list) and len(definition) > 0:
+        #             definition = definition[0]
+                    
+        #         user_input = instance.get("inputs", instance.get("input", ""))
+        #         target_output = instance.get("targets", instance.get("output", ""))
+                
+        #         # 安全解包列表类型的答案
+        #         if isinstance(target_output, list) and len(target_output) > 0:
+        #             target_output = target_output[0]
+                    
+        #         prompt = f"Instruction: {definition}\n\nInput: {user_input}" if definition else f"Input: {user_input}"
+                
+        #         conversation = [
+        #             {"from": "human", "value": prompt},
+        #             {"from": "gpt", "value": target_output}
+        #         ]
+        #         list_data_dict.append({"conversations": conversation})
+        else:
+            # 兜底
+            list_data_dict = loaded_data
+            
+        # =================================================================================
 
-        if data_args.memory_data_path is not None:
+        if getattr(data_args, 'memory_data_path', None) is not None:
             list_memory_data_dict = json.load(open(data_args.memory_data_path, "r"))
-
             list_data_dict = list_data_dict + list_memory_data_dict
             
+            # 💡 连续学习提醒：如果在单个任务内部 Shuffle 是没问题的；
+            # 但如果你把多个任务合并成一个文件传进来，这里的 Shuffle 会破坏连续学习的顺序。
             random.shuffle(list_data_dict)
 
-        rank0_print("Formatting inputs...Skip in lazy mode")
+        # rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
         self.data_args = data_args
-        # 估算 Warmup 需要多少样本，并把它们复制一份放在最前面
-        # 这样 TE 训练完副本后，SE 刚好能从正本开始训练
-        if model_args is not None and model_args.warmup_tokens > 0:
-            # 1. 获取预设的 warmup token 数量
+        
+        # --- 完全保留你的 MoE Warmup 机制 ---
+        if model_args is not None and getattr(model_args, 'warmup_tokens', 0) > 0:
             target_tokens = model_args.warmup_tokens
-            
-            # 2. 估算每个样本的平均长度 (为了效率，只采样前100个估算)
             sample_size = min(len(self.list_data_dict), 100)
             if sample_size > 0:
                 total_len = 0
                 for i in range(sample_size):
-                    # 简单估算：字符数 / 3 (近似 Token 数) + 图片 Token
                     sample = self.list_data_dict[i]
                     text_len = sum(len(conv['value']) for conv in sample['conversations']) // 3
-                    img_len = 576 if 'image' in sample else 0 # 假设图片 token 数，根据你的 config 调整
+                    img_len = 576 if 'image' in sample else 0
                     total_len += (text_len + img_len)
                 
                 avg_len = max(1, total_len // sample_size)
-                
-                # 3. 计算需要复制多少样本
                 num_replay_samples = int(math.ceil(target_tokens / avg_len))
-                
-                # 4. 安全限制：不要复制超过整个数据集
                 num_replay_samples = min(num_replay_samples, len(self.list_data_dict))
                 
                 if num_replay_samples > 0:
@@ -688,11 +983,11 @@ class CPMoEDataset(Dataset):
                     rank0_print(f"  - Est. Avg Length: {avg_len}")
                     rank0_print(f"  - Replicating first {num_replay_samples} samples for TE training.")
                     
-                    # 5. 执行复制：[Warmup Copies] + [Original Full Data]
                     warmup_subset = copy.deepcopy(self.list_data_dict[:num_replay_samples])
                     self.list_data_dict = warmup_subset + self.list_data_dict
                     
                     rank0_print(f"  - New Dataset Size: {len(self.list_data_dict)}\n")
+
     def __len__(self):
         return len(self.list_data_dict)
 
@@ -718,6 +1013,7 @@ class CPMoEDataset(Dataset):
         if isinstance(i, int):
             sources = [sources]
         assert len(sources) == 1, "Don't know why it is wrapped to a list"  # FIXME
+        
         if 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
@@ -745,10 +1041,12 @@ class CPMoEDataset(Dataset):
                 self.data_args)
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
+            
         data_dict = preprocess(
             sources,
             self.tokenizer,
             has_image=('image' in self.list_data_dict[i]))
+            
         if isinstance(i, int):
             data_dict = dict(input_ids=data_dict["input_ids"][0],
                              labels=data_dict["labels"][0])
@@ -756,10 +1054,82 @@ class CPMoEDataset(Dataset):
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
-        elif self.data_args.is_multimodal:
+        elif getattr(self.data_args, 'is_multimodal', False):
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
             data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            
+        return data_dict
+
+    def __len__(self):
+        return len(self.list_data_dict)
+
+    @property
+    def lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            img_tokens = 128 if 'image' in sample else 0
+            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
+        return length_list
+
+    @property
+    def modality_lengths(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+            cur_len = cur_len if 'image' in sample else -cur_len
+            length_list.append(cur_len)
+        return length_list
+
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        sources = self.list_data_dict[i]
+        if isinstance(i, int):
+            sources = [sources]
+        assert len(sources) == 1, "Don't know why it is wrapped to a list"  
+        
+        if 'image' in sources[0]:
+            image_file = self.list_data_dict[i]['image']
+            image_folder = self.data_args.image_folder
+            processor = self.data_args.image_processor
+            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            if self.data_args.image_aspect_ratio == 'pad':
+                def expand2square(pil_img, background_color):
+                    width, height = pil_img.size
+                    if width == height:
+                        return pil_img
+                    elif width > height:
+                        result = Image.new(pil_img.mode, (width, width), background_color)
+                        result.paste(pil_img, (0, (width - height) // 2))
+                        return result
+                    else:
+                        result = Image.new(pil_img.mode, (height, height), background_color)
+                        result.paste(pil_img, ((height - width) // 2, 0))
+                        return result
+                image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            else:
+                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+            sources = preprocess_multimodal(
+                copy.deepcopy([e["conversations"] for e in sources]),
+                self.data_args)
+        else:
+            sources = copy.deepcopy([e["conversations"] for e in sources])
+            
+        data_dict = preprocess(
+            sources,
+            self.tokenizer,
+            has_image=('image' in self.list_data_dict[i]))
+            
+        if isinstance(i, int):
+            data_dict = dict(input_ids=data_dict["input_ids"][0],
+                             labels=data_dict["labels"][0])
+
+        if 'image' in self.list_data_dict[i]:
+            data_dict['image'] = image
+        elif getattr(self.data_args, 'is_multimodal', False):
+            crop_size = self.data_args.image_processor.crop_size
+            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
+            
         return data_dict
 
 class LazySupervisedDataset(Dataset):
@@ -1286,6 +1656,7 @@ def train():
  # =========================================================
     # 1. 训练
     # =========================================================
+    
     trainer.train()
     
     # =========================================================

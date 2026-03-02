@@ -46,4 +46,5 @@ deepspeed --include localhost:0,1 --master_port 29600 llava/train/train_mem_MOE.
     --lazy_preprocess True \
     --report_to none \
     --lora_target_modules gate_proj up_proj down_proj \
-    --task commonsense
+    --task commonsense \
+    --warmup_tokens 0

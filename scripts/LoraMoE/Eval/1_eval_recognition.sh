@@ -12,18 +12,18 @@ else
 fi
 
 if [ ! -n "$2" ] ;then
-    MODELPATH='./checkpoints/CL4VQA/causal-4ep/llava-1.5-7b-lora'
+    MODELPATH='./checkpoints/CL4VQA/recognition-4ep/llava-1.5-7b-lora'
 else
     MODELPATH=$2
 fi
 
-RESULT_DIR="./results/CLMoE/recognition-4ep"
+RESULT_DIR="./results/CLMoE/recognition"
 
 for IDX in $(seq 0 $((CHUNKS-1))); do
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m llava.eval.CLMoE.eval_token_monitor \
         --model-path $MODELPATH \
         --model-base /srv/scratch/cruise/Yang/models/vicuna-7b-v1.5 \
-        --question-file /srv/scratch/cruise/Yang/CL4VQA/test/test_q_recognition.json \
+        --question-file /srv/scratch/cruise/Yang/data/superni_data/test/test_q_recognition.json \
         --image-folder /srv/scratch/cruise/Yang/ \
         --answers-file $RESULT_DIR/$STAGE/${CHUNKS}_${IDX}.jsonl \
         --num-chunks $CHUNKS \

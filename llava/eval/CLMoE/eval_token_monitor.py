@@ -40,8 +40,21 @@ def eval_model(args):
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
-    with open(os.path.expanduser(args.question_file), "r") as f:
-        questions = json.load(f)
+    # with open(os.path.expanduser(args.question_file), "r") as f:
+    #     questions = json.load(f)
+    question_file_path = os.path.expanduser(args.question_file)
+    questions = []
+    try:
+        with open(question_file_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+            # 兼容 SuperNI 字典或普通列表
+            questions = loaded.get("Instances", loaded) if isinstance(loaded, dict) else loaded
+    except json.decoder.JSONDecodeError:
+        # 兼容 JSONL 多行格式
+        with open(question_file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    questions.append(json.loads(line))
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
     
     answers_file = os.path.expanduser(args.answers_file)

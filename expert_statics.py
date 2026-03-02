@@ -100,6 +100,6 @@ def aggregate_and_plot_routing_logs(input_folder, file_pattern='routing*log*.jso
 # ==========================================
 if __name__ == "__main__":
     # 将 "." 替换为你的实际文件夹路径
-    target_folder = "/srv/scratch/cruise/Yang/Lora-MoE/results/CLMoE/location-4ep/Finetune/logs" 
+    target_folder = "/srv/scratch/cruise/Yang/Lora-MoE/results/CLMoE/commonsense-4ep/Finetune/logs" 
     
     aggregate_and_plot_routing_logs(target_folder)

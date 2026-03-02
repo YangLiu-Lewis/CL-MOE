@@ -35,4 +35,4 @@ export CUDA_VISIBLE_DEVICES=0,1
 echo ">>> Running GPU_test.py..."
 conda activate cl
 cd /srv/scratch/cruise/Yang/Lora-MoE/
-bash scripts/LoraMoE/Eval/Eval_all.sh
+bash scripts/LoraMoE/Train_NI/Train.sh
