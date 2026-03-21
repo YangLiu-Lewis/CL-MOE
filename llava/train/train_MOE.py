@@ -396,10 +396,10 @@ def preprocess_llama_2(
 
             if has_image:
                 round_len = len(tokenizer_image_token(rou, tokenizer))
-                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 2
+                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
             else:
-                round_len = len(tokenizer(rou).input_ids)
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 2
+                round_len = len(tokenizer(rou, add_special_tokens=False).input_ids) + 1
+                instruction_len = len(tokenizer(parts[0], add_special_tokens=False).input_ids) -1
 
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
@@ -413,7 +413,28 @@ def preprocess_llama_2(
                     f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
                     f" (ignored)"
                 )
-
+# ==========================================
+        # 调试打印逻辑：观测掩码是否精准对齐
+        # ==========================================
+        print("\n" + "="*40)
+        print("[DEBUG] Tokenization & Masking Check")
+        print("="*40)
+        
+        # 提取第一个样本中参与 Loss 计算的有效 token
+        valid_labels = targets[0][targets[0] != IGNORE_INDEX]
+        # 提取第一个样本中被屏蔽（设为 IGNORE_INDEX）的 token
+        masked_inputs = input_ids[0][targets[0] == IGNORE_INDEX]
+        
+        print("1. 实际参与训练的目标文本 (Valid Labels):")
+        # 理想情况：这里应该*仅仅*包含答案，绝对不能有 "[/INST]" 或用户输入
+        print(repr(tokenizer.decode(valid_labels)))
+        
+        print("\n2. 被屏蔽的输入文本 (Masked Inputs):")
+        # 理想情况：这里应该包含 <s> [INST] ... [/INST]
+        print(repr(tokenizer.decode(masked_inputs)))
+        
+        print(f"\n3. 长度比对: cur_len={cur_len}, total_len={total_len}")
+        print("="*40 + "\n")
     return dict(
         input_ids=input_ids,
         labels=targets,
@@ -1154,7 +1175,10 @@ def train():
     else:
         tokenizer.pad_token = tokenizer.unk_token
         if model_args.version in conversation_lib.conv_templates:
-            conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
+            my_conv = conversation_lib.conv_templates[model_args.version].copy()
+            if model_args.version == "llama_2":
+                my_conv.system = "" 
+            conversation_lib.default_conversation = my_conv
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
