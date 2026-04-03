@@ -44,8 +44,7 @@ def eval_single(annotation_file, result_file, output_file=None):
 
     # ================= 3. 计算 ROUGE-L =================
     for i in range(total):
-        pred_text = results[i].get('text', '')
-        
+        pred_text = results[i].get('text', '').strip().rstrip('.')        
         # 提取目标答案
         ground_truth = annotations[i].get('output', annotations[i].get('targets', []))
         if isinstance(ground_truth, str):

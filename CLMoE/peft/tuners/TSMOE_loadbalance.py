@@ -81,22 +81,18 @@ class TSMoERouter(nn.Module):
             self.num_experts, 
             bias=getattr(config, "router_bias", False)
         )
-        self.register_buffer("expert_similarities", torch.zeros(self.num_experts))        
-        self.register_buffer("expert_bias", torch.zeros(self.num_experts))
+        self.register_buffer("permeation_potential", torch.zeros(self.num_experts))        
+        # self.dtype = getattr(torch, getattr(config, "router_dtype", "float32")) # 这行其实没用了
         self.beta = getattr(config, "cka_beta", 0.1)
-        self.bias_update_rate = getattr(config, "router_bias_update_rate", 0.01)
         self.threshold = getattr(config, "warmup_tokens", 650)
         self.register_buffer("processed_tokens", torch.tensor(0, dtype=torch.long))
         self.register_buffer("warm_end", torch.tensor(False, dtype=torch.bool))
         self.jitter_noise = getattr(config, "router_jitter_noise", 0.0)
         torch.nn.init.normal_(self.classifier.weight, mean=0.0, std=0.01)
     
-    def _compute_router_probabilities(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _compute_router_probabilities(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
             """
-            计算路由结果：
-            1. 使用原始 affinity 作为 expert 权重来源；
-            2. 使用 affinity + bias 仅进行 top-k 专家选择；
-            3. 对选中的原始 affinity 做 sigmoid，并在 top-k 内归一化。
+            计算路由概率，包含 CKA 潜在偏差 (CKA guided injection) 的注入逻辑。
             """
             input_dtype = hidden_states.dtype
             
@@ -104,20 +100,22 @@ class TSMoERouter(nn.Module):
             if self.training and self.jitter_noise > 0:
                 hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
 
-            # 2. 原始 affinity
+            # 2. 计算 Logits
             router_logits = self.classifier(hidden_states)
-            topk_indices, topk_weights = self._get_topk_with_bias(router_logits, k=2)
-            topk_weights = topk_weights.to(input_dtype)
+            router_probabilities_pure = nn.functional.softmax(router_logits, dim=-1, dtype=torch.float32).to(input_dtype)
+            # print("Router Probabilities (Pure):", router_probabilities_pure[0])
+            
+            # 3. [关键] 注入离线计算的 CKA 指导 (beta * CKA_Score)
+            # 只有当 self.beta > 0 且 permeation_potential 被离线脚本更新过才有意义
 
-            # 3. 用 top-k 结果更新 batch-wise bias buffer
-            if self.training:
-                self._update_bias_buffer(topk_indices)
+            if self.beta > 0:
+                # 注意广播机制: [Batch, Seq, Experts] + [Experts]
+                router_logits = router_logits + (self.beta * self.permeation_potential)
 
-            # if self.beta > 0:
-            #     # 注意广播机制: [Batch, Seq, Experts] + [Experts]
-            #     router_logits = router_logits + (self.beta * self.expert_similarities)
-
-            return topk_indices, topk_weights, router_logits
+            # 4. Softmax
+            router_probabilities = nn.functional.softmax(router_logits, dim=-1, dtype=torch.float32).to(input_dtype)
+            # print("Router Probabilities (With CKA):", router_probabilities[0])
+            return router_probabilities, router_logits
     def compute_entropy_loss(self, router_logits: torch.Tensor) -> torch.Tensor:
         """
         [Entropy Maximization Loss]
@@ -180,49 +178,7 @@ class TSMoERouter(nn.Module):
         loss = (density_1 * density_2).sum() * num_experts
 
         return loss
-    def _get_topk_with_bias(self, router_logits: torch.Tensor, k: int = 2):
-        """
-        使用 (logits + bias) 进行专家选择。
-        """
-        selection_logits = router_logits + self.expert_bias
-        # 关键：torch.topk 返回 (values, indices)，我们只需要 indices
-        _, indices = torch.topk(selection_logits, k=k, dim=-1)
-        topk_original_logits = router_logits.gather(dim=-1, index=indices)
-        topk_scores = torch.sigmoid(topk_original_logits.to(torch.float32))
-        topk_weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
-        return indices, topk_weights
-    def _update_bias_buffer(self, topk_indices: torch.Tensor):
-        if not self.training:
-            return
-
-        # 1. 计算当前卡的局部计数 (Local count)
-        active_indices = topk_indices.view(-1)
-        expert_count = torch.bincount(active_indices, minlength=self.num_experts).float()
-        
-        # 2. 【关键】同步全局计数 (Global sync)
-        # 只有执行了这一步，各卡算出的 bias_delta 才是完全一致的
-        if torch.distributed.is_initialized():
-            import torch.distributed as dist
-            # 汇总所有显卡的专家选择次数
-            dist.all_reduce(expert_count, op=dist.ReduceOp.SUM)
-            
-            # 汇总总 Token 选择次数 (Batch * Seq * K)
-            total_selections = torch.tensor([active_indices.numel()], 
-                                        device=active_indices.device, 
-                                        dtype=torch.float)
-            dist.all_reduce(total_selections, op=dist.ReduceOp.SUM)
-            global_numel = total_selections.item()
-        else:
-            global_numel = active_indices.numel()
-
-        # 3. 计算全局占用率并更新
-        current_util = expert_count / global_numel
-        target_util = 1.0 / self.num_experts
-        
-        bias_delta = self.bias_update_rate * (target_util - current_util)
-        
-        # 因为上面同步了计数，所以这里的 add_ 在所有卡上增加的数值是完全一样的
-        self.expert_bias.add_(bias_delta)
+    
     def forward(self, hidden_states: torch.Tensor) -> Tuple:
         """
         返回: (topk_indices, topk_weights, router_logits, use_te, warm_end)
@@ -233,8 +189,14 @@ class TSMoERouter(nn.Module):
         # 场景 A: 推理模式 (Inference)
         # =================================================
         if not self.training:
+            input_dtype = hidden_states.dtype
             # 直接使用 Router
-            topk_indices, topk_weights, router_logits = self._compute_router_probabilities(hidden_states)
+            router_probs, router_logits = self._compute_router_probabilities(hidden_states)
+            
+            # Top-1 路由 (推理通常只选 Top-1 以加速，或者保持 Top-2)
+            topk_weights, topk_indices = torch.topk(router_probs, k=2, dim=-1) # 这里保持 Top-2
+            # topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+            topk_weights = topk_weights.to(input_dtype)
             
             # use_te=False, warm_end=False
             return topk_indices, topk_weights, router_logits, False, False
@@ -289,7 +251,8 @@ class TSMoERouter(nn.Module):
         # =================================================
         # 分支 2: Stable 阶段 (使用 Router + SE)
         # =================================================
-        topk_indices, topk_weights, router_logits = self._compute_router_probabilities(hidden_states)
+        input_dtype = hidden_states.dtype
+        router_probs, router_logits = self._compute_router_probabilities(hidden_states)
         
         # 计算负载均衡 Loss (Aux Loss)
         # 确保你的类里有 expert_num (例如 4)
@@ -300,6 +263,11 @@ class TSMoERouter(nn.Module):
                  num_experts=self.num_experts,
                  top_k=2
              )
+             
+        # Top-K 选择
+        topk_weights, topk_indices = torch.topk(router_probs, k=2, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        topk_weights = topk_weights.to(input_dtype)
         
         # use_te=False, warm_end=False
         return topk_indices, topk_weights, router_logits, False, False
@@ -713,7 +681,7 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
         # 4. 【注入参数】更新 Router 的 Permeation Potential
         if adapter_name in self.lora_router:
             # 使用 copy_ 原地更新 buffer，不破坏计算图
-            self.lora_router[adapter_name].expert_similarities.copy_(cka_tensor)
+            self.lora_router[adapter_name].permeation_potential.copy_(cka_tensor)
         for i in range(self.expert_num):
             similarity = cka_scores[i]
 

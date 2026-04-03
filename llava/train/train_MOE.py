@@ -84,6 +84,8 @@ class DataArguments:
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
+    seed: int = field(default=42)
+    data_seed: Optional[int] = field(default=42)
     optim: str = field(default="adamw_torch")
     remove_unused_columns: bool = field(default=False)
     freeze_mm_mlp_adapter: bool = field(default=False)
@@ -358,7 +360,15 @@ def preprocess_llama_2(
             role = roles[sentence["from"]]
             assert role == conv.roles[j % 2], f"{i}"
             conv.append_message(role, sentence["value"])
-        conversations.append(conv.get_prompt())
+        # conversations.append(conv.get_prompt())
+        raw_prompt = conv.get_prompt()
+        
+        # 物理切除默认的系统提示词（适配 Llama-2 的特定格式）
+        bad_system_prompt = "<<SYS>>\nYou are a helpful language and vision assistant. You are able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language.\n<</SYS>>\n\n"
+        
+        clean_prompt = raw_prompt.replace(bad_system_prompt, "")
+        
+        conversations.append(clean_prompt)
 
     # Tokenize conversations
 
@@ -413,28 +423,23 @@ def preprocess_llama_2(
                     f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
                     f" (ignored)"
                 )
-# ==========================================
-        # 调试打印逻辑：观测掩码是否精准对齐
-        # ==========================================
-        print("\n" + "="*40)
-        print("[DEBUG] Tokenization & Masking Check")
-        print("="*40)
+
         
-        # 提取第一个样本中参与 Loss 计算的有效 token
-        valid_labels = targets[0][targets[0] != IGNORE_INDEX]
-        # 提取第一个样本中被屏蔽（设为 IGNORE_INDEX）的 token
-        masked_inputs = input_ids[0][targets[0] == IGNORE_INDEX]
+        # # 提取第一个样本中参与 Loss 计算的有效 token
+        # valid_labels = targets[0][targets[0] != IGNORE_INDEX]
+        # # 提取第一个样本中被屏蔽（设为 IGNORE_INDEX）的 token
+        # masked_inputs = input_ids[0][targets[0] == IGNORE_INDEX]
         
-        print("1. 实际参与训练的目标文本 (Valid Labels):")
-        # 理想情况：这里应该*仅仅*包含答案，绝对不能有 "[/INST]" 或用户输入
-        print(repr(tokenizer.decode(valid_labels)))
+        # print("1. 实际参与训练的目标文本 (Valid Labels):")
+        # # 理想情况：这里应该*仅仅*包含答案，绝对不能有 "[/INST]" 或用户输入
+        # print(repr(tokenizer.decode(valid_labels)))
         
-        print("\n2. 被屏蔽的输入文本 (Masked Inputs):")
-        # 理想情况：这里应该包含 <s> [INST] ... [/INST]
-        print(repr(tokenizer.decode(masked_inputs)))
+        # print("\n2. 被屏蔽的输入文本 (Masked Inputs):")
+        # # 理想情况：这里应该包含 <s> [INST] ... [/INST]
+        # print(repr(tokenizer.decode(masked_inputs)))
         
-        print(f"\n3. 长度比对: cur_len={cur_len}, total_len={total_len}")
-        print("="*40 + "\n")
+        # print(f"\n3. 长度比对: cur_len={cur_len}, total_len={total_len}")
+        # print("="*40 + "\n")
     return dict(
         input_ids=input_ids,
         labels=targets,
@@ -1031,6 +1036,8 @@ def set_global_seed(seed):
     import random
     import numpy as np
     import torch
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     
     # 1. Python random
     random.seed(seed)
@@ -1046,6 +1053,7 @@ def set_global_seed(seed):
     # 4. 强制 CuDNN 使用确定性算法 (会慢一点点，但为了稳定必须加)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
     
     # 5. Transformers 库自带的锁种
     transformers.set_seed(seed)
@@ -1056,6 +1064,7 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    set_global_seed(training_args.seed)
     with open("/srv/scratch/cruise/Yang/CL-MoE/CLMoE/task.txt", "w") as t:
         t.write(model_args.task)
     local_rank = training_args.local_rank
@@ -1174,6 +1183,15 @@ def train():
         tokenizer.pad_token = tokenizer.unk_token
     else:
         tokenizer.pad_token = tokenizer.unk_token
+
+
+
+        # if tokenizer.pad_token is None:
+        #     tokenizer.pad_token = tokenizer.eos_token
+        # tokenizer.pad_token_id = tokenizer.convert_tokens_to_ids(tokenizer.pad_token)
+        # print(f"\n[INFO] Tokenizer pad_token is set to: '{tokenizer.pad_token}' with ID: {tokenizer.pad_token_id}\n")
+
+        
         if model_args.version in conversation_lib.conv_templates:
             my_conv = conversation_lib.conv_templates[model_args.version].copy()
             if model_args.version == "llama_2":

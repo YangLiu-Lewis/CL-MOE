@@ -67,8 +67,8 @@ def get_modality_length_grouped_indices(lengths, batch_size, world_size, generat
     mm_indices, mm_lengths = zip(*[(i, l) for i, l in enumerate(lengths) if l > 0])
     lang_indices, lang_lengths = zip(*[(i, -l) for i, l in enumerate(lengths) if l < 0])
 
-    mm_shuffle = [mm_indices[i] for i in get_length_grouped_indices(mm_lengths, batch_size, world_size, generator=None)]
-    lang_shuffle = [lang_indices[i] for i in get_length_grouped_indices(lang_lengths, batch_size, world_size, generator=None)]
+    mm_shuffle = [mm_indices[i] for i in get_length_grouped_indices(mm_lengths, batch_size, world_size, generator=generator)]
+    lang_shuffle = [lang_indices[i] for i in get_length_grouped_indices(lang_lengths, batch_size, world_size, generator=generator)]
     megabatch_size = world_size * batch_size
     mm_megabatches = [mm_shuffle[i : i + megabatch_size] for i in range(0, len(mm_shuffle), megabatch_size)]
     lang_megabatches = [lang_shuffle[i : i + megabatch_size] for i in range(0, len(lang_shuffle), megabatch_size)]
@@ -139,10 +139,14 @@ class LLaVATrainer(Trainer):
 
         if self.args.group_by_modality_length:
             lengths = self.train_dataset.modality_lengths
+            seed = self.args.data_seed if self.args.data_seed is not None else self.args.seed
+            generator = torch.Generator()
+            generator.manual_seed(seed)
             return LengthGroupedSampler(
                 self.args.train_batch_size,
                 world_size=self.args.world_size * self.args.gradient_accumulation_steps,
                 lengths=lengths,
+                generator=generator,
                 group_by_modality=True,
             )
         else:
@@ -174,12 +178,12 @@ class LLaVATrainer(Trainer):
         # 2. [新增] 触发 Transient Expert 的梯度累积 (SI 算法核心)
         # 这必须发生在 backward() 之后，optimizer.step() 之前！
         # 兼容不同的模型包装方式 (DDP, DeepSpeed, PeftModel 等)
-        # if hasattr(model, "accumulate_te_grad"):
-        #     model.accumulate_te_grad("default")
-        # elif hasattr(model, "module") and hasattr(model.module, "accumulate_te_grad"):
-        #     model.module.accumulate_te_grad("default")
-        # elif hasattr(model, "base_model") and hasattr(model.base_model, "accumulate_te_grad"):
-        #     model.base_model.accumulate_te_grad("default")
+        if hasattr(model, "accumulate_te_grad"):
+            model.accumulate_te_grad("default")
+        elif hasattr(model, "module") and hasattr(model.module, "accumulate_te_grad"):
+            model.module.accumulate_te_grad("default")
+        elif hasattr(model, "base_model") and hasattr(model.base_model, "accumulate_te_grad"):
+            model.base_model.accumulate_te_grad("default")
 
         return loss.detach() / self.args.gradient_accumulation_steps
 
@@ -204,15 +208,29 @@ class LLaVATrainer(Trainer):
 
 
         moe_aux_loss = torch.tensor(0.0, device=loss.device)
+        moe_reg_loss = torch.tensor(0.0, device=loss.device)
+        moe_entropy_loss = torch.tensor(0.0, device=loss.device)
 
         for name, module in model.named_modules():
+            if hasattr(module, "get_regularization_loss"):
+                reg_term = module.get_regularization_loss()
+                moe_reg_loss = moe_reg_loss + reg_term # 使用显式加法
+            if hasattr(module, "router_entropy_loss"):
+                # 累加 aux loss
+                entropy_loss_term = module.router_entropy_loss
+                moe_entropy_loss = moe_entropy_loss + entropy_loss_term
             if hasattr(module, "router_aux_loss"):
                 # 累加 aux loss
                 aux_loss_term = module.router_aux_loss
                 moe_aux_loss = moe_aux_loss + aux_loss_term
-        moe_aux_loss = moe_aux_loss /96
+        moe_aux_loss = moe_aux_loss / 448
         # print(f"MoE Aux Loss: {moe_aux_loss.item()}")
-        total_loss = loss + (0.1 * moe_aux_loss)
+        # total_loss = loss + 5000 * moe_reg_loss + 0.2 * moe_aux_loss
+        total_loss = loss + 5000 * moe_reg_loss
+
+        # print(f"MoE Aux Loss: {0.2*moe_aux_loss.item()}")
+        print(f" \nMoE Reg Loss: {moe_reg_loss.item()*5000}")
+        
         
         return (total_loss, outputs) if return_outputs else total_loss
 
