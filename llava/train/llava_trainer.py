@@ -223,9 +223,9 @@ class LLaVATrainer(Trainer):
                 # 累加 aux loss
                 aux_loss_term = module.router_aux_loss
                 moe_aux_loss = moe_aux_loss + aux_loss_term
-        moe_aux_loss = moe_aux_loss / 448
+        moe_aux_loss = moe_aux_loss / 224
         # print(f"MoE Aux Loss: {moe_aux_loss.item()}")
-        # total_loss = loss + 5000 * moe_reg_loss + 0.2 * moe_aux_loss
+        # total_loss = loss + 5000 * moe_reg_loss + 0.1 * moe_aux_loss
         total_loss = loss + 5000 * moe_reg_loss
 
         # print(f"MoE Aux Loss: {0.2*moe_aux_loss.item()}")

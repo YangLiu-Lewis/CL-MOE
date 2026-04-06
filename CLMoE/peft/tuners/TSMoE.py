@@ -63,6 +63,7 @@ class CLMoEMOELoraConfig(LoraConfig):
     expert_num: int = field(default=4)
     router_bias_update_rate: float = field(default=0.001)  # u for expert bias
     router_tolerance_ratio: float = field(default=0.2) # tao for tolerance
+    cka_beta: float = field(default=0.01)  # alpha for CKA structural inductive bias (Eq.9)
     def __post_init__(self):
         self.peft_type = PeftType.MOE_LORA_CLMoE
 
@@ -83,7 +84,7 @@ class TSMoERouter(nn.Module):
         )
         self.register_buffer("expert_similarities", torch.zeros(self.num_experts))        
         self.register_buffer("expert_bias", torch.zeros(self.num_experts))
-        self.beta = getattr(config, "cka_beta", 0.1)
+        self.beta = getattr(config, "cka_beta", 0.01)
         self.bias_update_rate = getattr(config, "router_bias_update_rate", 0.01)
         self.threshold = getattr(config, "warmup_tokens", 650)
         self.register_buffer("processed_tokens", torch.tensor(0, dtype=torch.long))
@@ -112,10 +113,6 @@ class TSMoERouter(nn.Module):
             # 3. 用 top-k 结果更新 batch-wise bias buffer
             if self.training:
                 self._update_bias_buffer(topk_indices)
-
-            # if self.beta > 0:
-            #     # 注意广播机制: [Batch, Seq, Experts] + [Experts]
-            #     router_logits = router_logits + (self.beta * self.expert_similarities)
 
             return topk_indices, topk_weights, router_logits
     def compute_entropy_loss(self, router_logits: torch.Tensor) -> torch.Tensor:
@@ -182,9 +179,11 @@ class TSMoERouter(nn.Module):
         return loss
     def _get_topk_with_bias(self, router_logits: torch.Tensor, k: int = 2):
         """
-        使用 (logits + bias) 进行专家选择。
+        使用 (logits + CKA_bias + load_bias) 进行专家选择。
+        对应公式 Eq.(9): s_{i,t} + alpha * H_cp^{(i)} + b_i^{(t}) ∈ TopK
         """
-        selection_logits = router_logits + self.expert_bias
+        selection_logits = router_logits + self.beta * self.expert_similarities + self.expert_bias
+        # print("the beta * CKA bias and normal bias", self.beta * self.expert_similarities, "load bias:", self.expert_bias)  # Debug: 打印 CKA bias 和 load bias 的数值范围
         # 关键：torch.topk 返回 (values, indices)，我们只需要 indices
         _, indices = torch.topk(selection_logits, k=k, dim=-1)
         topk_original_logits = router_logits.gather(dim=-1, index=indices)
@@ -293,13 +292,13 @@ class TSMoERouter(nn.Module):
         
         # 计算负载均衡 Loss (Aux Loss)
         # 确保你的类里有 expert_num (例如 4)
-        if self.training:
-            #  self.router_entropy_loss = self.compute_entropy_loss(router_logits)
-             self.router_aux_loss = self.compute_load_balancing_loss(
-                 router_logits, 
-                 num_experts=self.num_experts,
-                 top_k=2
-             )
+        # if self.training:
+        #     #  self.router_entropy_loss = self.compute_entropy_loss(router_logits)
+        #      self.router_aux_loss = self.compute_load_balancing_loss(
+        #          router_logits, 
+        #          num_experts=self.num_experts,
+        #          top_k=2
+        #      )
         
         # use_te=False, warm_end=False
         return topk_indices, topk_weights, router_logits, False, False
@@ -715,7 +714,7 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
             # 使用 copy_ 原地更新 buffer，不破坏计算图
             self.lora_router[adapter_name].expert_similarities.copy_(cka_tensor)
         for i in range(self.expert_num):
-            similarity = cka_scores[i]
+            similarity = final_cka_scores[i]  # 使用多卡同步后的全局平均值
 
             # A. 取出旧 Mask (如果不存在则初始化为空字典)
             # 注意：这里我们深拷贝一份，因为我们要修改它并存入 pending
