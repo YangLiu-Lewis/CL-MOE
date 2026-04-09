@@ -15,9 +15,16 @@ else
 fi
 
 if [ ! -n "$2" ] ;then
-    MODELPATH="./checkpoints/CL4VQA/${MODEL_NAME}/llava-1.5-7b-lora"
+    MODELPATH="./checkpoints/CL4VQA/${MODEL_NAME}/llama-2-7b-hf-lora"
 else
     MODELPATH=$2
+fi
+
+if [ ! -n "$3" ] ;then
+    echo "Missing required cka_beta argument. Usage: bash $0 <stage> <model_path> <cka_beta>"
+    exit 1
+else
+    CKA_BETA=$3
 fi
 
 # 💡 核心改动 2：统一测试集路径 (确保你在切分时把后缀改成了 _test.json)
@@ -31,12 +38,14 @@ mkdir -p $RESULT_DIR/$STAGE
 for IDX in $(seq 0 $((CHUNKS-1))); do
     CUDA_VISIBLE_DEVICES=${GPULIST[$IDX]} python -m llava.eval.CLMoE.eval_token_monitor_NI \
         --model-path $MODELPATH \
-        --model-base /srv/scratch/cruise/Yang/models/vicuna-7b-v1.5 \
+        --model-base /srv/scratch/cruise/Yang/models/llama-2-7b-chat \
         --question-file $TEST_FILE \
         --answers-file $RESULT_DIR/$STAGE/${CHUNKS}_${IDX}.jsonl \
         --num-chunks $CHUNKS \
         --chunk-idx $IDX \
         --temperature 0 \
+        --seed 42 \
+        --cka_beta $CKA_BETA \
         --conv-mode vicuna_v1 & 
 done
 

@@ -225,11 +225,11 @@ class LLaVATrainer(Trainer):
                 moe_aux_loss = moe_aux_loss + aux_loss_term
         moe_aux_loss = moe_aux_loss / 224
         # print(f"MoE Aux Loss: {moe_aux_loss.item()}")
-        # total_loss = loss + 5000 * moe_reg_loss + 0.1 * moe_aux_loss
-        total_loss = loss + 5000 * moe_reg_loss
+        total_loss = loss + 5000 * moe_reg_loss + 0.1 * moe_aux_loss
+        # total_loss = loss + 0.1 * moe_aux_loss
 
         # print(f"MoE Aux Loss: {0.2*moe_aux_loss.item()}")
-        print(f" \nMoE Reg Loss: {moe_reg_loss.item()*5000}")
+        # print(f" \nMoE Reg Loss: {moe_reg_loss.item()*5000}")
         
         
         return (total_loss, outputs) if return_outputs else total_loss

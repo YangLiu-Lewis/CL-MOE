@@ -1,27 +1,27 @@
 ################## VICUNA ##################
-PROMPT_VERSION=v1
-MODEL_VERSION="vicuna-7b-v1.5"
+# PROMPT_VERSION="plain" 
+# MODEL_VERSION="Llama-2-7b-hf"
 ################## VICUNA ##################
 
 
 ################## LLaMA-2 ##################
-# PROMPT_VERSION="llava_llama_2"
-# MODEL_VERSION="Llama-2-7b-chat-hf"
+PROMPT_VERSION="llava_llama_2"
+MODEL_VERSION="Llama-2-7b-chat-hf"
 ################## LLaMA-2 ##################
 
 deepspeed --include localhost:0,1 --master_port 29603 llava/train/train_mem_MOE.py \
     --deepspeed ./scripts/zero1_offload.json \
-    --lora_enable True --lora_r 16 --lora_alpha 16 --mm_projector_lr 2e-5 \
+    --lora_enable True --lora_r 32 --lora_alpha 32    \
     --expert_num 4 \
-    --model_name_or_path /srv/scratch/cruise/Yang/models/vicuna-7b-v1.5 \
+    --model_name_or_path /srv/scratch/cruise/Yang/models/llama-2-7b-chat \
     --version $PROMPT_VERSION \
     --data_path /srv/scratch/cruise/Yang/Lora-MoE/SuperNI/task073_commonsenseqa_answer_generation/train.json \
     --image_folder /srv/scratch/cruise/Yang/ \
-    --previous_task_model_path ./checkpoints/CL4VQA/task1729/llava-1.5-7b-lora \
+    --previous_task_model_path ./checkpoints/CL4VQA/task1510/llama-2-7b-hf-lora \
     --group_by_modality_length False \
     --bf16 True \
-    --output_dir ./checkpoints/CL4VQA/task073/llava-1.5-7b-lora \
-    --num_train_epochs 1 \
+    --output_dir ./checkpoints/CL4VQA/task073/llama-2-7b-hf-lora \
+    --num_train_epochs 3 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 16 \
     --gradient_accumulation_steps 1 \
@@ -29,7 +29,7 @@ deepspeed --include localhost:0,1 --master_port 29603 llava/train/train_mem_MOE.
     --save_strategy "steps" \
     --save_steps 50000 \
     --save_total_limit  1 \
-    --learning_rate 2e-4 \
+    --learning_rate 2e-04 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
@@ -43,3 +43,4 @@ deepspeed --include localhost:0,1 --master_port 29603 llava/train/train_mem_MOE.
     --lora_target_modules gate_proj up_proj down_proj q_proj k_proj v_proj o_proj \
     --task quoref \
     --warmup_tokens 10000
+        --cka_beta 0.1 \

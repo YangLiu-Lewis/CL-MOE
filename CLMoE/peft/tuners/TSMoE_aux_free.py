@@ -54,7 +54,6 @@ if is_bnb_available():
 class CLMoEMOELoraConfig(LoraConfig):
     #todo currently we setting the warmup_tokens to 100000, futher can be replaced by HT-SR metrics.
     warmup_tokens: int = field(default=10000)
-    cka_beta: Optional[float] = field(default=None)
     """
     This is the configuration class to store the configuration of a [`~peft.MOE_LORA_CLMoE`]
     """
@@ -62,11 +61,10 @@ class CLMoEMOELoraConfig(LoraConfig):
     # Fix: 使用 default_factory 防止可变参数陷阱
     target_modules: Optional[List[str]] = field(default_factory=lambda: ["gate_proj", "up_proj", "down_proj"])
     expert_num: int = field(default=4)
-    router_bias_update_rate: float = field(default=0.001)  # u for expert bias
+    router_bias_update_rate: float = field(default=0.01)  # u for expert bias
     router_tolerance_ratio: float = field(default=0.2) # tao for tolerance
+    cka_beta: float = field(default=0.001)  # alpha for CKA structural inductive bias (Eq.9)
     def __post_init__(self):
-        if self.cka_beta is None:
-            raise ValueError("CLMoEMOELoraConfig requires cka_beta to be provided explicitly.")
         self.peft_type = PeftType.MOE_LORA_CLMoE
 
 # ==========================================
@@ -84,19 +82,22 @@ class TSMoERouter(nn.Module):
             self.num_experts, 
             bias=getattr(config, "router_bias", False)
         )
-        self.register_buffer("permeation_potential", torch.zeros(self.num_experts))        
-        # self.dtype = getattr(torch, getattr(config, "router_dtype", "float32")) # 这行其实没用了
-        self.beta = getattr(config, "cka_beta", 0.2)
+        self.register_buffer("expert_similarities", torch.zeros(self.num_experts))        
+        self.register_buffer("expert_bias", torch.zeros(self.num_experts))
+        self.beta = getattr(config, "cka_beta", 0.001)
+        self.bias_update_rate = getattr(config, "router_bias_update_rate", 0.01)
         self.threshold = getattr(config, "warmup_tokens", 650)
         self.register_buffer("processed_tokens", torch.tensor(0, dtype=torch.long))
         self.register_buffer("warm_end", torch.tensor(False, dtype=torch.bool))
         self.jitter_noise = getattr(config, "router_jitter_noise", 0.0)
         torch.nn.init.normal_(self.classifier.weight, mean=0.0, std=0.01)
     
-    def _compute_router_probabilities(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _compute_router_probabilities(self, hidden_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             """
-            计算路由概率。
-            CKA 只作为路由选择时的额外偏置，不修改原始 router logits。
+            计算路由结果：
+            1. 使用原始 affinity 作为 expert 权重来源；
+            2. 使用 affinity + bias 仅进行 top-k 专家选择；
+            3. 对选中的原始 affinity 做 sigmoid，并在 top-k 内归一化。
             """
             input_dtype = hidden_states.dtype
             
@@ -104,22 +105,16 @@ class TSMoERouter(nn.Module):
             if self.training and self.jitter_noise > 0:
                 hidden_states = hidden_states * torch.empty_like(hidden_states).uniform_(1.0 - self.jitter_noise, 1.0 + self.jitter_noise)
 
-            # 2. 计算 Logits
+            # 2. 原始 affinity
             router_logits = self.classifier(hidden_states)
-            selection_logits = router_logits
-            
-            # 3. [关键] 注入离线计算的 CKA 指导 (beta * CKA_Score)
-            # 只有当 self.beta > 0 且 permeation_potential 被离线脚本更新过才有意义。
-            # 这里仅影响路由选择，不污染原始 logits 及其下游损失。
+            topk_indices, topk_weights = self._get_topk_with_bias(router_logits, k=2)
+            topk_weights = topk_weights.to(input_dtype)
 
-            if self.beta > 0:
-                # 注意广播机制: [Batch, Seq, Experts] + [Experts]
-                selection_logits = selection_logits + (self.beta * self.permeation_potential)
+            # 3. 用 top-k 结果更新 batch-wise bias buffer
+            if self.training:
+                self._update_bias_buffer(topk_indices)
 
-            # 4. Softmax
-            router_probabilities = nn.functional.softmax(selection_logits, dim=-1, dtype=torch.float32).to(input_dtype)
-            # print("Router Probabilities (With CKA):", router_probabilities[0])
-            return router_probabilities, router_logits
+            return topk_indices, topk_weights, router_logits
     def compute_entropy_loss(self, router_logits: torch.Tensor) -> torch.Tensor:
         """
         [Entropy Maximization Loss]
@@ -182,7 +177,53 @@ class TSMoERouter(nn.Module):
         loss = (density_1 * density_2).sum() * num_experts
 
         return loss
-    
+    def _get_topk_with_bias(self, router_logits: torch.Tensor, k: int = 2):
+        """
+        使用 (logits + CKA_bias + load_bias) 进行专家选择。
+        对应公式 Eq.(9): s_{i,t} + alpha * H_cp^{(i)} + b_i^{(t}) ∈ TopK
+        """
+        # expert_bias is only applied during training (load balancing signal)
+        # At inference, use pure logits + CKA to avoid forcing suboptimal uniform routing
+        load_bias = self.expert_bias if self.training else torch.zeros_like(self.expert_bias)
+        inference_beta = self.beta if self.training else 0.0  # In inference, we can choose to ignore the CKA bias or keep it. Here we keep it for better routing decisions.
+        selection_logits = router_logits + inference_beta * self.expert_similarities + load_bias
+        _, indices = torch.topk(selection_logits, k=k, dim=-1)
+        topk_original_logits = router_logits.gather(dim=-1, index=indices)
+        topk_scores = torch.sigmoid(topk_original_logits.to(torch.float32))
+        topk_weights = topk_scores / topk_scores.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+        return indices, topk_weights
+    def _update_bias_buffer(self, topk_indices: torch.Tensor):
+        if not self.training:
+            return
+
+        # 1. 计算当前卡的局部计数 (Local count)
+        active_indices = topk_indices.view(-1)
+        expert_count = torch.bincount(active_indices, minlength=self.num_experts).float()
+        
+        # 2. 【关键】同步全局计数 (Global sync)
+        # 只有执行了这一步，各卡算出的 bias_delta 才是完全一致的
+        if torch.distributed.is_initialized():
+            import torch.distributed as dist
+            # 汇总所有显卡的专家选择次数
+            dist.all_reduce(expert_count, op=dist.ReduceOp.SUM)
+            
+            # 汇总总 Token 选择次数 (Batch * Seq * K)
+            total_selections = torch.tensor([active_indices.numel()], 
+                                        device=active_indices.device, 
+                                        dtype=torch.float)
+            dist.all_reduce(total_selections, op=dist.ReduceOp.SUM)
+            global_numel = total_selections.item()
+        else:
+            global_numel = active_indices.numel()
+
+        # 3. 计算全局占用率并更新
+        current_util = expert_count / global_numel
+        target_util = 1.0 / self.num_experts
+        
+        bias_delta = self.bias_update_rate * (target_util - current_util)
+        
+        # 因为上面同步了计数，所以这里的 add_ 在所有卡上增加的数值是完全一样的
+        self.expert_bias.add_(bias_delta)
     def forward(self, hidden_states: torch.Tensor) -> Tuple:
         """
         返回: (topk_indices, topk_weights, router_logits, use_te, warm_end)
@@ -193,14 +234,8 @@ class TSMoERouter(nn.Module):
         # 场景 A: 推理模式 (Inference)
         # =================================================
         if not self.training:
-            input_dtype = hidden_states.dtype
             # 直接使用 Router
-            router_probs, router_logits = self._compute_router_probabilities(hidden_states)
-            
-            # Top-1 路由 (推理通常只选 Top-1 以加速，或者保持 Top-2)
-            topk_weights, topk_indices = torch.topk(router_probs, k=2, dim=-1) # 这里保持 Top-2
-            # topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-            topk_weights = topk_weights.to(input_dtype)
+            topk_indices, topk_weights, router_logits = self._compute_router_probabilities(hidden_states)
             
             # use_te=False, warm_end=False
             return topk_indices, topk_weights, router_logits, False, False
@@ -255,23 +290,17 @@ class TSMoERouter(nn.Module):
         # =================================================
         # 分支 2: Stable 阶段 (使用 Router + SE)
         # =================================================
-        input_dtype = hidden_states.dtype
-        router_probs, router_logits = self._compute_router_probabilities(hidden_states)
+        topk_indices, topk_weights, router_logits = self._compute_router_probabilities(hidden_states)
         
         # 计算负载均衡 Loss (Aux Loss)
         # 确保你的类里有 expert_num (例如 4)
-        if self.training:
-            #  self.router_entropy_loss = self.compute_entropy_loss(router_logits)
-             self.router_aux_loss = self.compute_load_balancing_loss(
-                 router_logits, 
-                 num_experts=self.num_experts,
-                 top_k=2
-             )
-             
-        # Top-K 选择
-        topk_weights, topk_indices = torch.topk(router_probs, k=2, dim=-1)
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
-        topk_weights = topk_weights.to(input_dtype)
+        # if self.training:
+        #     #  self.router_entropy_loss = self.compute_entropy_loss(router_logits)
+        #      self.router_aux_loss = self.compute_load_balancing_loss(
+        #          router_logits, 
+        #          num_experts=self.num_experts,
+        #          top_k=2
+        #      )
         
         # use_te=False, warm_end=False
         return topk_indices, topk_weights, router_logits, False, False
@@ -533,7 +562,6 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
         self.expert_num = kwargs.pop("expert_num", 4) # 修正: 给默认值防止报错
         self.te_dim = kwargs.pop("task_embedding_dim", 64) # 修正: 给默认值
         self.warmup_tokens = kwargs.pop('warmup_tokens', 10000) # 修正: 给默认值
-        self.cka_beta = kwargs.pop("cka_beta")
         self.noisy_gating = True
         self.pending_mask_updates = {}
         self.topk = 2
@@ -551,7 +579,6 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
             adapter_name: TSMoERouter(  # 改为 TSMoERouter
                 config=CLMoEMOELoraConfig( # 构造临时 config 传入，或者直接传参数
                     warmup_tokens=threshold,
-                    cka_beta=self.cka_beta,
                     expert_num=self.expert_num,
                     task_embedding_dim=self.te_dim  
                 ),
@@ -592,6 +619,9 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
         # 4. 初始化 Expert Masks
         self.expert_masks = [{} for _ in range(self.expert_num)]
         self.anchor_params = [{} for _ in range(self.expert_num)]
+        # 5. CKA 用的 hidden state 积累 buffer
+        self.te_repr_buffer: List[torch.Tensor] = []
+        self.te_repr_buffer_max_tokens: int = 4096  # 最多积累多少 token
     
     def forward(self, x: torch.Tensor, **kwargs):
         previous_dtype = x.dtype
@@ -615,12 +645,21 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
                 # === Warmup Phase (TE) ===
                 te_layer = self.transient_experts[self.active_adapter]
                 result += te_layer(x) * self.scaling[self.active_adapter]
+                # 积累 hidden states 用于后续 CKA 计算
+                if self.training:
+                    curr_tokens = x.view(-1, x.size(-1))
+                    if sum(t.size(0) for t in self.te_repr_buffer) < self.te_repr_buffer_max_tokens:
+                        self.te_repr_buffer.append(curr_tokens.detach().cpu())
                 if warm_end and self.training:
                     # 触发 Warmup 结束逻辑
                     self.calculate_te_si(self.active_adapter)
-                    # x_detached = x.detach()
                     with torch.no_grad():
-                        self.allocate_expert_and_mask(self.active_adapter, validation_data=x)        
+                        if self.te_repr_buffer:
+                            validation_data = torch.cat(self.te_repr_buffer, dim=0).to(x.device)
+                            self.te_repr_buffer.clear()
+                        else:
+                            validation_data = x
+                        self.allocate_expert_and_mask(self.active_adapter, validation_data=validation_data)        
             else:
                 # === Stable Phase ===
                 for i in range(self.expert_num):
@@ -674,6 +713,7 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
             # print(se_repr.mean)
             score = linear_cka(te_repr, se_repr)
             cka_scores.append(score)
+        print(f"CKA Scores for adapter '{adapter_name}': {cka_scores}")  # Debug: 打印每个 Expert 的 CKA 分数
         # 3. 【关键】多卡同步 CKA 分数 (Global Sync)
         # 将 list 转为 tensor 放入 GPU
         device = self.weight.device
@@ -687,9 +727,9 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
         # 4. 【注入参数】更新 Router 的 Permeation Potential
         if adapter_name in self.lora_router:
             # 使用 copy_ 原地更新 buffer，不破坏计算图
-            self.lora_router[adapter_name].permeation_potential.copy_(cka_tensor)
+            self.lora_router[adapter_name].expert_similarities.copy_(cka_tensor)
         for i in range(self.expert_num):
-            similarity = cka_scores[i]
+            similarity = final_cka_scores[i]  # 使用多卡同步后的全局平均值
 
             # A. 取出旧 Mask (如果不存在则初始化为空字典)
             # 注意：这里我们深拷贝一份，因为我们要修改它并存入 pending
@@ -706,10 +746,7 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
                     target_device = te_importance_tensor.device 
 
                 te_val = te_importance_tensor.to(target_device)
-                # update_term = similarity * te_val
-                #这里暂时不和相似度乘试试结果
-                update_term = te_val
-
+                update_term = similarity * te_val
                 
                 # C. 执行累加 (Lithification)
                 if param_name in updated_mask:
@@ -1003,7 +1040,6 @@ class CLMoEMOELoraModel(LoraModel):
             "init_lora_weights": lora_config.init_lora_weights,
             "task_embedding_dim": lora_config.task_embedding_dim,
             "expert_num": lora_config.expert_num,
-            "cka_beta": lora_config.cka_beta,
             "warmup_tokens": getattr(lora_config, "warmup_tokens", 10000),
         }
         loaded_in_4bit = getattr(self.model, "is_loaded_in_4bit", False)

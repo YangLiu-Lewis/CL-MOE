@@ -64,6 +64,7 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=True)
     mm_vision_select_feature: Optional[str] = field(default="patch")
     warmup_tokens: int = field(default=100000, metadata={"help": "Number of tokens for TE warmup."})
+    cka_beta: Optional[float] = field(default=None, metadata={"help": "Required router CKA bias weight."})
     task_embedding_dim: Optional[int] = field(default=64)
     expert_num: Optional[int] = field(default=4)
     task: Optional[str] = field(default="")
@@ -1064,6 +1065,8 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.cka_beta is None:
+        raise ValueError("Missing required argument: --cka_beta")
     set_global_seed(training_args.seed)
     with open("/srv/scratch/cruise/Yang/CL-MoE/CLMoE/task.txt", "w") as t:
         t.write(model_args.task)
@@ -1134,6 +1137,7 @@ def train():
             "task_embedding_dim": model_args.task_embedding_dim,
             "expert_num": model_args.expert_num,
             "warmup_tokens": model_args.warmup_tokens,
+            "cka_beta": model_args.cka_beta,
             }
         targets = getattr(training_args, 'lora_target_modules', None)# 可传参改变
         if targets is None:

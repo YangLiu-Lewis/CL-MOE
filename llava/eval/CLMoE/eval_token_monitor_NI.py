@@ -1,7 +1,10 @@
 import argparse
-import torch
-import os
 import json
+import os
+import random
+
+import numpy as np
+import torch
 from tqdm import tqdm
 import shortuuid
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
@@ -23,10 +26,24 @@ def split_list(lst, n):
 def get_chunk(lst, n, k):
     chunks = split_list(lst, n)
     return chunks[k]
+
+
+def set_global_seed(seed):
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
     
 def eval_model(args):
     # Model
     disable_torch_init()
+    set_global_seed(args.seed)
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
     from CLMoE.peft import PeftModel
@@ -45,7 +62,8 @@ def eval_model(args):
     )
     
     print(f"Mounting LoRA: {args.model_path}")
-    model = PeftModel.from_pretrained(model, args.model_path)
+    model = PeftModel.from_pretrained(model, args.model_path, cka_beta=args.cka_beta)
+    model.eval()
     
     image_processor = None
     context_len = 4096    
@@ -244,6 +262,8 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--cka_beta", type=float, required=True)
     
     args = parser.parse_args()
     eval_model(args)

@@ -54,7 +54,7 @@ def aggregate_and_plot_routing_logs(input_folder, file_pattern='routing*log*.jso
 
     # 4. 计算总比率并构建表格
     # 假设有 4 个专家
-    num_experts = 4 
+    num_experts = 8 
     rows = []
     
     # 对层号进行排序 (0, 1, 2 ... 31)
@@ -100,6 +100,6 @@ def aggregate_and_plot_routing_logs(input_folder, file_pattern='routing*log*.jso
 # ==========================================
 if __name__ == "__main__":
     # 将 "." 替换为你的实际文件夹路径
-    target_folder = "/srv/scratch/cruise/Yang/Lora-MoE/results/CLMoE/commonsense-4ep/Finetune/logs" 
+    target_folder = "/srv/scratch/cruise/Yang/Lora-MoE/results/CLMoE/task1572/CL-CKA0.2/logs" 
     
     aggregate_and_plot_routing_logs(target_folder)

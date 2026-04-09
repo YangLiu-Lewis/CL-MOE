@@ -107,7 +107,6 @@ class TSMoERouter(nn.Module):
             
             # 3. [关键] 注入离线计算的 CKA 指导 (beta * CKA_Score)
             # 只有当 self.beta > 0 且 permeation_potential 被离线脚本更新过才有意义
-
             if self.beta > 0:
                 # 注意广播机制: [Batch, Seq, Experts] + [Experts]
                 router_logits = router_logits + (self.beta * self.permeation_potential)
