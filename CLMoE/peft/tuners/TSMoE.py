@@ -706,9 +706,8 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
                     target_device = te_importance_tensor.device 
 
                 te_val = te_importance_tensor.to(target_device)
-                # update_term = similarity * te_val
-                #这里暂时不和相似度乘试试结果
-                update_term = te_val
+                update_term = similarity * te_val
+
 
                 
                 # C. 执行累加 (Lithification)
