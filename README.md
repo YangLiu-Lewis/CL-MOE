@@ -1,75 +1,69 @@
-# [CVPR 2025](https://arxiv.org/abs/2503.00413) CL-MoE: Enhancing Multimodal Large Language Model with Dual Momentum Mixture-of-Experts for Continual Visual Question Answering
+# CP-MoE
 
-Tianyu Huai, Jie Zhou, Xingjiao Wu, Qin Chen, Qingchun Bai, Ze Zhou, Liang He.
-
-<img src="./framework.png">
-
-## Abstract
-
-Multimodal large language models (MLLMs) have garnered widespread attention from researchers due to their remarkable understanding and generation capabilities in visual language tasks (e.g., visual question answering). However, the rapid pace of knowledge updates in the real world makes offline training of MLLMs costly, and when faced with non-stationary data streams, MLLMs suffer from catastrophic forgetting during learning. In this paper, we propose an MLLMs-based dual momentum Mixture-of-Experts (CL-MoE) framework for continual visual question answering (VQA). We integrate MLLMs with continual learning to utilize the rich commonsense knowledge in LLMs. We introduce a Dual-Router MoE (RMoE) strategy to select the global and local experts using task-level and instance-level routers, to robustly assign weights to the experts most appropriate for the task. Then, we design a dynamic Momentum MoE (MMoE) to update the parameters of experts dynamically based on the relationships between the experts and tasks/instances, so that the model can absorb new knowledge while maintaining existing knowledge. The extensive experimental results indicate that our method achieves state-of-the-art performance on 10 VQA tasks, proving the effectiveness of our approach.
+Consistency-Preserving Mixture-of-Experts (LoRA-MoE) for continual instruction tuning, built on LLaVA / CL-MoE.
 
 ## Install
 
-1. Clone this repository and navigate to CLMoE folder
-
-``` 
-git clone https://github.com/ECNU-ICALK/CL-MoE.git
-cd CL-MoE 
-```
-
-2. Install Package
-
-```
-conda create -n clmoe python=3.10 -y
-conda activate clmoe
-pip install --upgrade pip
+```bash
+conda create -n cpmoe python=3.10 -y
+conda activate cpmoe
 pip install -e .
-```
-
-3. Install additional packages for training cases
-
-```
 pip install -e ".[train]"
 pip install flash-attn --no-build-isolation
 ```
 
-This repo is based on [LLaVA](https://github.com/haotian-liu/LLaVA). 
-If you meet a problem, maybe you could find some solutions in issuses.
+## Data
 
-## Dataset
+SuperNI tasks, one folder per task:
 
-Please download the images from the COCO2014 dataset，include [train2014](http://images.cocodataset.org/zips/train2014.zip) and [val2014](http://images.cocodataset.org/zips/val2014.zip).
+```
+SuperNI/<task_name>/train.json
+SuperNI/<task_name>/test.json
+```
 
-Please download the instruction from [CL4VQA](https://drive.google.com/drive/folders/1mcAjzmCU1UVW0TKvsHAy9Sr1hmwsJudo?usp=drive_link).
+## Training
 
-## Instruction Tuning
+Each task has its own script under `scripts/LoraMoE/Train_NI/`. Train tasks sequentially
+in order (the output of one task is the init for the next):
 
-First, downloading the pretrained projectors in [LLaVA Model_Zoo](https://github.com/haotian-liu/LLaVA/blob/main/docs/MODEL_ZOO.md).
+```bash
+# single task
+bash scripts/LoraMoE/Train_NI/1_task1572.sh
 
-Setting `pretrain_mm_mlp_adapter` to the projector path.
-You could modify the `deepspeed config` to change the deepspeed config.
+# full continual-learning order (task 1 → 15)
+bash scripts/LoraMoE/Train_NI/Train.sh
+```
 
-We provide the scripts of our train order in `scripts/CLMoE/Train`.
-Note, the `output_dir` of the previous script is the `previous_task_model_path` of the next training process.
-Then, you could tune these datasets in your order.
+Key arguments (set inside each script):
+
+| Arg | Meaning |
+| --- | --- |
+| `--expert_num` | number of LoRA experts (default 8) |
+| `--lora_r` / `--lora_alpha` | LoRA rank / alpha |
+| `--cka_beta` | router CKA bias weight |
+| `--use_cka_mask` | weight expert-mask update by CKA similarity (default `True`; set `False` to ablate) |
+| `--warmup_tokens` | task-embedding warmup token budget |
+| `--lora_target_modules` | modules to inject LoRA into |
+
+Checkpoints are written to `--output_dir` (e.g. `./checkpoints/CL4VQA/<task>/...`).
 
 ## Evaluation
 
-We have prepared the scripts to evaluate the trained model in `scripts/CLMoE/Eval`.
+Each task has a matching eval script under `scripts/LoraMoE/Eval_NI/`.
+Usage: `bash <script> <stage> <model_path> <cka_beta>`.
 
-## Citation
+```bash
+# single task
+bash scripts/LoraMoE/Eval_NI/1_task1572.sh Finetune ./checkpoints/CL4VQA/task1572/llama-2-7b-hf-lora 0.2
 
+# evaluate all tasks
+bash scripts/LoraMoE/Eval_NI/Eval_all.sh
 ```
-@article{huai2025cl,
-  title={CL-MoE: Enhancing Multimodal Large Language Model with Dual Momentum Mixture-of-Experts for Continual Visual Question Answering},
-  author={Huai, Tianyu and Zhou, Jie and Wu, Xingjiao and Chen, Qin and Bai, Qingchun and Zhou, Ze and He, Liang},
-  journal={arXiv preprint arXiv:2503.00413},
-  year={2025}
-}
-```
+
+Each script runs multi-GPU inference (uses `CUDA_VISIBLE_DEVICES`), merges the
+shards, and scores with `llava/eval/CLMoE/eval_superni.py`. Results and the
+`accuracy_result.txt` land in `./results/CLMoE/<task>/<stage>/`.
 
 ## Acknowledgement
 
-[LLaVA](https://github.com/haotian-liu/LLaVA): the codebase we built upon, and our base model LLaVA-1.5-7b that has the amazing vision-language capabilities! 
-
-If you have any questions about CL-MOE, please leave us a comment in the issue.
+Built on [LLaVA](https://github.com/haotian-liu/LLaVA) and [CL-MoE](https://github.com/ECNU-ICALK/CL-MoE).
