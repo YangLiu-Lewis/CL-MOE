@@ -62,6 +62,7 @@ class CLMoEMOELoraConfig(LoraConfig):
     # Fix: 使用 default_factory 防止可变参数陷阱
     target_modules: Optional[List[str]] = field(default_factory=lambda: ["gate_proj", "up_proj", "down_proj"])
     expert_num: int = field(default=4)
+    use_cka_mask: bool = field(default=True)
     router_bias_update_rate: float = field(default=0.001)  # u for expert bias
     router_tolerance_ratio: float = field(default=0.2) # tao for tolerance
     def __post_init__(self):
@@ -534,6 +535,7 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
         self.te_dim = kwargs.pop("task_embedding_dim", 64) # 修正: 给默认值
         self.warmup_tokens = kwargs.pop('warmup_tokens', 10000) # 修正: 给默认值
         self.cka_beta = kwargs.pop("cka_beta")
+        self.use_cka_mask = kwargs.pop("use_cka_mask", True)
         self.noisy_gating = True
         self.pending_mask_updates = {}
         self.topk = 2
@@ -706,7 +708,7 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
                     target_device = te_importance_tensor.device 
 
                 te_val = te_importance_tensor.to(target_device)
-                update_term = similarity * te_val
+                update_term = similarity * te_val if self.use_cka_mask else te_val
 
 
                 
@@ -1004,6 +1006,7 @@ class CLMoEMOELoraModel(LoraModel):
             "expert_num": lora_config.expert_num,
             "cka_beta": lora_config.cka_beta,
             "warmup_tokens": getattr(lora_config, "warmup_tokens", 10000),
+            "use_cka_mask": getattr(lora_config, "use_cka_mask", True),
         }
         loaded_in_4bit = getattr(self.model, "is_loaded_in_4bit", False)
         loaded_in_8bit = getattr(self.model, "is_loaded_in_8bit", False)

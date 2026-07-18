@@ -65,6 +65,7 @@ class ModelArguments:
     mm_vision_select_feature: Optional[str] = field(default="patch")
     warmup_tokens: int = field(default=100000, metadata={"help": "Number of tokens for TE warmup."})
     cka_beta: Optional[float] = field(default=None, metadata={"help": "Required router CKA bias weight."})
+    use_cka_mask: bool = field(default=True, metadata={"help": "Whether to weight expert mask by CKA similarity."})
     task_embedding_dim: Optional[int] = field(default=64)
     expert_num: Optional[int] = field(default=4)
     task: Optional[str] = field(default="")
@@ -1133,11 +1134,12 @@ def train():
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     if training_args.lora_enable:
-        kwargs = { 
+        kwargs = {
             "task_embedding_dim": model_args.task_embedding_dim,
             "expert_num": model_args.expert_num,
             "warmup_tokens": model_args.warmup_tokens,
             "cka_beta": model_args.cka_beta,
+            "use_cka_mask": model_args.use_cka_mask,
             }
         targets = getattr(training_args, 'lora_target_modules', None)# 可传参改变
         if targets is None:
